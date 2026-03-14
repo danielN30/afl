@@ -1,0 +1,289 @@
+---
+title: "aflpredictor"
+format: html
+editor: visual
+---
+
+library(fitzRoy)
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+library(xgboost)
+
+install.packages("shiny")
+library(shiny)
+
+
+```{r}
+# ---- 1. PULL DATA ----
+match_results <- fetch_results_afltables(2015:2024)
+player_stats <- fetch_player_stats_afltables(2015:2024)
+
+glimpse(match_results)
+glimpse(player_stats)
+```
+
+```{r}
+# ---- 2. FEATURE ENGINEERING ----
+
+# Filter regular season only
+match_data <- match_results %>%
+  filter(Round.Type == "Regular") %>%
+  arrange(Date) %>%
+  mutate(Home.Win = ifelse(Margin > 0, 1, 0))
+
+# Calculate rolling form (last 5 games) for each team
+get_rolling_form <- function(team_name, data, n = 5) {
+  home_games <- data %>%
+    filter(Home.Team == team_name) %>%
+    mutate(Team = team_name, Win = ifelse(Margin > 0, 1, 0),
+           Points.For = Home.Points, Points.Against = Away.Points)
+  
+  away_games <- data %>%
+    filter(Away.Team == team_name) %>%
+    mutate(Team = team_name, Win = ifelse(Margin < 0, 1, 0),
+           Points.For = Away.Points, Points.Against = Home.Points)
+  
+  bind_rows(home_games, away_games) %>%
+    arrange(Date) %>%
+    mutate(
+      Rolling.Wins    = zoo::rollmean(Win, n, fill = NA, align = "right"),
+      Rolling.PtsFor  = zoo::rollmean(Points.For, n, fill = NA, align = "right"),
+      Rolling.PtsAga  = zoo::rollmean(Points.Against, n, fill = NA, align = "right")
+    ) %>%
+    select(Date, Team, Rolling.Wins, Rolling.PtsFor, Rolling.PtsAga)
+}
+
+# Install zoo if needed
+if (!require(zoo)) install.packages("zoo")
+library(zoo)
+
+# Get form for all teams
+all_teams <- unique(c(match_data$Home.Team, match_data$Away.Team))
+
+team_form <- map_dfr(all_teams, ~get_rolling_form(.x, match_data))
+
+# Join form back to match data
+model_data <- match_data %>%
+  left_join(team_form, by = c("Date" = "Date", "Home.Team" = "Team")) %>%
+  rename(Home.Rolling.Wins   = Rolling.Wins,
+         Home.Rolling.PtsFor = Rolling.PtsFor,
+         Home.Rolling.PtsAga = Rolling.PtsAga) %>%
+  left_join(team_form, by = c("Date" = "Date", "Away.Team" = "Team")) %>%
+  rename(Away.Rolling.Wins   = Rolling.Wins,
+         Away.Rolling.PtsFor = Rolling.PtsFor,
+         Away.Rolling.PtsAga = Rolling.PtsAga) %>%
+  drop_na() %>%
+  mutate(Home.Win = as.factor(Home.Win))
+
+glimpse(model_data)
+```
+
+# ---- 3. BUILD THE MODEL ----
+
+# Select features
+model_features <- model_data %>%
+  select(
+    Home.Win,
+    Home.Rolling.Wins,
+    Home.Rolling.PtsFor,
+    Home.Rolling.PtsAga,
+    Away.Rolling.Wins,
+    Away.Rolling.PtsFor,
+    Away.Rolling.PtsAga
+  )
+
+# Train/test split (80/20)
+set.seed(42)
+split <- initial_split(model_features, prop = 0.8, strata = Home.Win)
+train <- training(split)
+test  <- testing(split)
+
+# Define model
+xgb_model <- boost_tree(
+  trees = 500,
+  tree_depth = 4,
+  learn_rate = 0.01
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+# Recipe
+recipe <- recipe(Home.Win ~ ., data = train)
+
+# Workflow
+wf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(xgb_model)
+
+# Train
+fit <- wf %>% fit(data = train)
+
+# Evaluate on test set
+predictions <- fit %>%
+  predict(test) %>%
+  bind_cols(predict(fit, test, type = "prob")) %>%
+  bind_cols(test)
+
+# Metrics
+metrics <- predictions %>%
+  metrics(truth = Home.Win, estimate = .pred_class)
+
+print(metrics)
+
+# Confusion matrix
+conf_mat(predictions, truth = Home.Win, estimate = .pred_class)
+``
+
+```{r}
+# ---- 4. PLAYER PERFORMANCE MODEL ----
+
+# Aggregate player stats per game
+player_model_data <- player_stats %>%
+  filter(!is.na(Disposals), !is.na(Goals)) %>%
+  arrange(ID, Date) %>%
+  group_by(ID, Player) %>%
+  mutate(
+    # Rolling averages (last 5 games per player)
+    Roll.Disposals = zoo::rollmean(Disposals, 5, fill = NA, align = "right"),
+    Roll.Goals     = zoo::rollmean(Goals, 5, fill = NA, align = "right"),
+    Roll.Tackles   = zoo::rollmean(Tackles, 5, fill = NA, align = "right"),
+    Roll.Marks     = zoo::rollmean(Marks, 5, fill = NA, align = "right"),
+    
+    # Target — next game disposals
+    Next.Disposals = lead(Disposals),
+    Next.Goals     = lead(Goals)
+  ) %>%
+  ungroup() %>%
+  drop_na(Roll.Disposals, Next.Disposals)
+
+glimpse(player_model_data)
+```
+
+
+```{r}
+# ---- 5. TRAIN PLAYER MODEL ----
+
+player_features <- player_model_data %>%
+  select(
+    Next.Disposals,
+    Roll.Disposals,
+    Roll.Goals,
+    Roll.Tackles,
+    Roll.Marks,
+    Age,
+    Career.Games,
+    Time.on.Ground
+  ) %>%
+  drop_na()
+
+# Train/test split
+set.seed(42)
+player_split <- initial_split(player_features, prop = 0.8)
+player_train <- training(player_split)
+player_test  <- testing(player_split)
+
+# Define regression model
+xgb_player <- boost_tree(
+  trees = 500,
+  tree_depth = 4,
+  learn_rate = 0.01
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+# Recipe
+player_recipe <- recipe(Next.Disposals ~ ., data = player_train)
+
+# Workflow
+player_wf <- workflow() %>%
+  add_recipe(player_recipe) %>%
+  add_model(xgb_player)
+
+# Train
+player_fit <- player_wf %>% fit(data = player_train)
+
+# Evaluate
+player_preds <- player_fit %>%
+  predict(player_test) %>%
+  bind_cols(player_test)
+
+# Metrics
+player_preds %>%
+  metrics(truth = Next.Disposals, estimate = .pred)
+```
+
+
+```{r}
+# ---- 6. PREDICTION FUNCTIONS ----
+
+# Predict match winner
+predict_match <- function(home_team, away_team) {
+  
+  # Get latest form for each team
+  home_form <- team_form %>%
+    filter(Team == home_team) %>%
+    arrange(desc(Date)) %>%
+    slice(1)
+  
+  away_form <- team_form %>%
+    filter(Team == away_team) %>%
+    arrange(desc(Date)) %>%
+    slice(1)
+  
+  # Build input
+  new_match <- tibble(
+    Home.Rolling.Wins   = home_form$Rolling.Wins,
+    Home.Rolling.PtsFor = home_form$Rolling.PtsFor,
+    Home.Rolling.PtsAga = home_form$Rolling.PtsAga,
+    Away.Rolling.Wins   = away_form$Rolling.Wins,
+    Away.Rolling.PtsFor = away_form$Rolling.PtsFor,
+    Away.Rolling.PtsAga = away_form$Rolling.PtsAga
+  )
+  
+  # Predict
+  prob <- predict(fit, new_match, type = "prob")
+  
+  cat("=================================\n")
+  cat(home_team, "vs", away_team, "\n")
+  cat("=================================\n")
+  cat("Home win probability: ", round(prob$.pred_1 * 100, 1), "%\n")
+  cat("Away win probability: ", round(prob$.pred_0 * 100, 1), "%\n")
+  cat("Prediction:", ifelse(prob$.pred_1 > 0.5, home_team, away_team), "to win\n")
+}
+
+# Predict player disposals
+predict_player <- function(player_name) {
+  
+  player_latest <- player_model_data %>%
+    filter(Player == player_name) %>%
+    arrange(desc(Date)) %>%
+    slice(1) %>%
+    select(Roll.Disposals, Roll.Goals, Roll.Tackles, 
+           Roll.Marks, Age, Career.Games, Time.on.Ground)
+  
+  if (nrow(player_latest) == 0) {
+    cat("Player not found! Check spelling.\n")
+    return(NULL)
+  }
+  
+  pred <- predict(player_fit, player_latest)
+  
+  cat("=================================\n")
+  cat("Player:", player_name, "\n")
+  cat("=================================\n")
+  cat("Predicted disposals next game:", round(pred$.pred, 1), "\n")
+}
+
+# ---- TRY IT OUT ----
+predict_match("Richmond", "Carlton")
+predict_match("Collingwood", "Melbourne")
+
+predict_player("Patrick Cripps")
+predict_player("Clayton Oliver")
+```
+
+
+
+
+
