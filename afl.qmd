@@ -275,13 +275,6 @@ predict_player <- function(player_name) {
   cat("Predicted disposals next game:", round(pred$.pred, 1), "\n")
 }
 
-# ---- TRY IT OUT ----
-predict_match("Richmond", "Carlton")
-predict_match("Collingwood", "Melbourne")
-
-predict_player("Patrick Cripps")
-predict_player("Clayton Oliver")
-```
 
 
 
